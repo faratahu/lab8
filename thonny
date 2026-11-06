@@ -1,0 +1,118 @@
+# Implements communication with Webots via Serial over USB.
+# Works with the "line_following_with_HIL" controller in Webots.
+
+# Tested with MicroPython v1.25.0 on ESP32 WROOM 32 dev kit board
+# communicating with Webots R2023a, on Windows 11 running Python 3.10.5 64-bit
+
+# Author: Felipe N. Martins
+# Date: 27 May 2025
+
+###### Close Thonny after start running this code #######
+# This is necessary because the serial port cannot be used by
+# two different programs (Thonny and Webots) at the same time.
+
+from machine import Pin, UART
+from time import sleep
+
+# LEDs
+led_board = Pin(2, Pin.OUT)     # Define ESP32 onboard LED
+led_yellow = Pin(4, Pin.OUT)
+led_blue = Pin(23, Pin.OUT)
+led_green = Pin(22, Pin.OUT)
+led_red = Pin(21, Pin.OUT)
+
+# Only the ESP32 board is used (no external buttons).
+# BOOT button on the board (GPIO 0): active LOW (0 when pressed).
+button_boot = Pin(0, Pin.IN, Pin.PULL_UP)
+
+# Start: press BOOT, or just wait START_DELAY seconds (it starts by itself).
+START_DELAY = 10
+print("Starting in", START_DELAY, "s (or press BOOT). Then CLOSE Thonny and run the Webots simulation.")
+print("Or click STOP in Thonny to return to the REPL.")
+t = 0
+while button_boot.value() == 1 and t < START_DELAY * 4:
+    sleep(0.25)
+    t += 1
+    led_board.value(not led_board())
+led_board.value(0)
+
+# Set serial to UART1 using the same pins as UART0 to communicate via USB
+uart = UART(1, 115200, tx=1, rx=3)
+
+# Initial status of the line sensor: updated by Webots via serial
+line_left = False
+line_center = False
+line_right = False
+
+# Variables to implement the line-following state machine
+current_state = 'forward'
+counter = 0
+COUNTER_MAX = 5
+COUNTER_STOP = 50
+state_updated = True
+
+while True:
+
+    ##################   See   ###################
+
+    # Check if anything was received via serial to update sensor status
+    if uart.any():
+        msg_bytes = uart.read()    # Read all received messages
+        msg_str = msg_bytes.decode('utf-8', 'ignore')  # Convert to string
+        # Keep only complete 3-character messages and use the latest one
+        # (Webots can send faster than the ESP32 can process)
+        msgs = [m.strip() for m in msg_str.split('\n') if len(m.strip()) == 3]
+        if msgs:
+            last = msgs[-1]    # order: left, center, right
+
+            line_left = (last[0] == '1')
+            line_center = (last[1] == '1')
+            line_right = (last[2] == '1')
+
+            led_blue.value(line_left)
+            led_green.value(line_center)
+            led_red.value(line_right)
+            led_board.value(1)   # debug: onboard LED ON = data from Webots received
+
+    ##################   Think   ###################
+
+    # Implement the line-following state machine transitions
+    if current_state == 'forward':
+        counter = 0
+        if line_right and not line_left:
+            current_state = 'turn_right'
+            state_updated = True
+        elif line_left and not line_right:
+            current_state = 'turn_left'
+            state_updated = True
+        elif line_left and line_right and line_center:  # lost the line
+            current_state = 'turn_left'
+            state_updated = True
+
+    if current_state == 'turn_right':
+        if counter >= COUNTER_MAX:
+            current_state = 'forward'
+            state_updated = True
+
+    if current_state == 'turn_left':
+        if counter >= COUNTER_MAX:
+            current_state = 'forward'
+            state_updated = True
+
+    if current_state == 'stop':
+        led_board.value(1)
+        if counter >= COUNTER_STOP:
+            current_state = 'forward'
+            state_updated = True
+            led_board.value(0)
+
+    ##################   Act   ###################
+
+    # Send the new state when updated
+    if state_updated == True:
+        uart.write(current_state + '\n')
+        print(current_state)          # show the full state in the Thonny Shell
+        state_updated = False
+
+    counter += 1    # increment counter
+    sleep(0.02)     # wait 0.02 seconds
