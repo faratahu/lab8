@@ -1,0 +1,164 @@
+"""line_following_with_HIL controller."""
+# Hardware-in-the-Loop simulation of the e-puck robot.
+# Ground sensor data is sent to an external board (ESP32) that decides the
+# next state of the robot. Communication is done via the serial port.
+#
+# USE_ESP32 = True  -> the ESP32 decides the state (real HIL)
+# USE_ESP32 = False -> the same state machine runs inside Webots, with no
+#                      ESP32 needed. Use it to check that the robot follows
+#                      the line, then switch back to True.
+
+from controller import Robot
+
+USE_ESP32 = True
+SERIAL_PORT = 'COM3'
+
+#-------------------------------------------------------
+# Open serial port to communicate with the microcontroller
+
+ser = None
+if USE_ESP32:
+    import serial
+    try:
+        # DTR/RTS are set to False BEFORE opening the port, so the CP2102
+        # does not reset the ESP32 when Webots opens the port.
+        ser = serial.Serial()
+        ser.port = SERIAL_PORT
+        ser.baudrate = 115200
+        ser.timeout = 0          # non-blocking read
+        ser.write_timeout = 0.1  # never freeze the simulation on write
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
+    except:
+        print("Communication failed. Check the cable connections and serial settings 'port' and 'baudrate'.")
+        raise
+
+#-------------------------------------------------------
+# Initialize variables
+
+MAX_SPEED = 6.28
+speed = 0.4 * MAX_SPEED
+
+robot = Robot()
+timestep = int(robot.getBasicTimeStep())   # [ms]
+
+# states
+states = ['forward', 'turn_right', 'turn_left', 'stop']
+current_state = 'forward'
+rx_buffer = ''
+
+# used only when USE_ESP32 = False (same logic as the ESP32 code)
+local_counter = 0
+LOCAL_COUNTER_MAX = 3      # ~ 5 ESP32 loops of 20 ms, in Webots steps
+
+#-------------------------------------------------------
+# Initialize devices
+
+ps = []
+psNames = ['ps0', 'ps1', 'ps2', 'ps3', 'ps4', 'ps5', 'ps6', 'ps7']
+for i in range(8):
+    ps.append(robot.getDevice(psNames[i]))
+    ps[i].enable(timestep)
+
+gs = []
+gsNames = ['gs0', 'gs1', 'gs2']
+for i in range(3):
+    gs.append(robot.getDevice(gsNames[i]))
+    gs[i].enable(timestep)
+
+leftMotor = robot.getDevice('left wheel motor')
+rightMotor = robot.getDevice('right wheel motor')
+leftMotor.setPosition(float('inf'))
+rightMotor.setPosition(float('inf'))
+leftMotor.setVelocity(0.0)
+rightMotor.setVelocity(0.0)
+
+#-------------------------------------------------------
+# Main loop (see-think-act)
+
+while robot.step(timestep) != -1:
+
+    ############################################
+    #                  See                     #
+    ############################################
+
+    gsValues = []
+    for i in range(3):
+        gsValues.append(gs[i].getValue())
+
+    # 1 = bright floor (> 600), 0 = dark line
+    line_right = gsValues[0] > 600
+    line_center = gsValues[1] > 600
+    line_left = gsValues[2] > 600
+
+    message = ''
+    message += '1' if line_left else '0'
+    message += '1' if line_center else '0'
+    message += '1' if line_right else '0'
+    msg_bytes = bytes(message + '\n', 'UTF-8')
+
+    ############################################
+    #                  Think                   #
+    ############################################
+
+    if USE_ESP32:
+        # Receive the new state from the ESP32 without ever blocking
+        data = ser.read(ser.in_waiting)
+        if data:
+            rx_buffer += data.decode('utf-8', errors='ignore')
+            while '\n' in rx_buffer:
+                line, rx_buffer = rx_buffer.split('\n', 1)
+                line = line.strip()
+                if line in states:
+                    current_state = line
+            if len(rx_buffer) > 100:
+                rx_buffer = ''
+    else:
+        # Local state machine (same transitions as the ESP32)
+        if current_state == 'forward':
+            local_counter = 0
+            if line_right and not line_left:
+                current_state = 'turn_right'
+            elif line_left and not line_right:
+                current_state = 'turn_left'
+            elif line_left and line_right and line_center:   # lost the line
+                current_state = 'turn_left'
+        elif current_state in ('turn_right', 'turn_left'):
+            local_counter += 1
+            if local_counter >= LOCAL_COUNTER_MAX:
+                current_state = 'forward'
+
+    leftSpeed = 0.0
+    rightSpeed = 0.0
+
+    if current_state == 'forward':
+        leftSpeed = speed
+        rightSpeed = speed
+    elif current_state == 'turn_right':
+        leftSpeed = 0.5 * speed
+        rightSpeed = 0.0
+    elif current_state == 'turn_left':
+        leftSpeed = 0.0
+        rightSpeed = 0.5 * speed
+    elif current_state == 'stop':
+        leftSpeed = 0.0
+        rightSpeed = 0.0
+
+    ############################################
+    #                  Act                     #
+    ############################################
+
+    leftMotor.setVelocity(leftSpeed)
+    rightMotor.setVelocity(rightSpeed)
+
+    print(f'Sensor message: {msg_bytes} - Current state: {current_state}')
+
+    if USE_ESP32:
+        try:
+            ser.write(msg_bytes)
+        except serial.SerialTimeoutException:
+            pass
+
+if ser is not None:
+    ser.close()
